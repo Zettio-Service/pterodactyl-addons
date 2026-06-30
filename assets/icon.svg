@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <linearGradient id="muIcon" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#38bdf8"/>
+      <stop offset="1" stop-color="#6366f1"/>
+    </linearGradient>
+  </defs>
+  <path d="M8 18a4 4 0 0 1 4-4h12l5 6h23a4 4 0 0 1 4 4v26a4 4 0 0 1-4 4H12a4 4 0 0 1-4-4V18Z" fill="url(#muIcon)"/>
+  <path d="M32 46V30" stroke="#0b1120" stroke-width="4" stroke-linecap="round"/>
+  <path d="M24 36l8-8 8 8" stroke="#0b1120" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

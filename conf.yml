@@ -1,0 +1,18 @@
+info:
+  name: "Multi Upload"
+  identifier: "multiupload"
+  description: "Upload whole folders and several directories into the file manager at once, keeping their structure and without zipping anything beforehand."
+  flags: ""
+  version: "1.0.0"
+  target: "beta-2026-06"
+  author: "Erik"
+  icon: "assets/icon.svg"
+
+admin:
+  view: "index.blade.php"
+
+dashboard:
+  wrapper: "wrapper.blade.php"
+
+data:
+  public: "public"
