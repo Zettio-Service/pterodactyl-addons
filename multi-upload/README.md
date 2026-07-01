@@ -2,7 +2,7 @@
 
 Blueprint extension for Pterodactyl by Erik.
 
-Upload whole folders into the server file manager at once. The folder is zipped in the browser,
+Upload whole folders into the server file manager at once. The folder is packed into a tar.gz in the browser,
 sent as a single archive, extracted by Wings and the archive is deleted right after, so the
 directory tree ends up intact without ever creating it path by path. Everything runs through the
 standard client API, so Wings itself is never modified and the extension keeps working across
@@ -14,8 +14,8 @@ Repository: https://github.com/Zettio-Service/pterodactyl-addons (folder `multi-
 
 - "Upload Folders" button next to the native Upload button, styled the same; opens a folder picker directly.
 - Drag a folder anywhere on the file manager and the upload starts on drop, no dialog in the way.
-- Folders are zipped client-side (native `CompressionStream`, no bundled libraries) and extracted server-side
-  with the existing `files/decompress` endpoint, then the archive is deleted.
+- Folders are packed into a tar.gz client-side (native `CompressionStream`, no bundled libraries) and extracted
+  server-side with the existing `files/decompress` endpoint, then the archive is deleted.
 - Very large drops are split into several archives automatically to stay under a safe upload size.
 - Plain files dropped without any folder still upload directly, unarchived.
 - A thin progress bar at the bottom of the page splits into two stages, upload then extract, with the

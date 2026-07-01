@@ -182,106 +182,87 @@
     return Promise.resolve({ files: [], dirs: new Set() });
   }
 
-  // ---- zero-dependency zip writer (store or deflate-raw via CompressionStream) ----
+  // ---- zero-dependency tar writer, gzipped through the native CompressionStream ----
 
-  const CRC_TABLE = (function () {
-    const table = new Uint32Array(256);
-    for (let n = 0; n < 256; n++) {
-      let c = n;
-      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
-      table[n] = c >>> 0;
-    }
-    return table;
-  })();
+  const TAR_ENCODER = new TextEncoder();
 
-  function crc32(bytes) {
-    let crc = 0xFFFFFFFF;
-    for (let i = 0; i < bytes.length; i++) crc = CRC_TABLE[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
-    return (crc ^ 0xFFFFFFFF) >>> 0;
+  function octalField(buf, offset, value, len) {
+    // (len - 1) octal digits, zero-padded, followed by a NUL byte.
+    let str = Math.floor(value).toString(8);
+    while (str.length < len - 1) str = '0' + str;
+    for (let i = 0; i < len - 1; i++) buf[offset + i] = str.charCodeAt(i);
+    buf[offset + len - 1] = 0;
   }
 
-  async function deflateRaw(bytes) {
-    if (typeof CompressionStream === 'undefined') return null;
-    const cs = new CompressionStream('deflate-raw');
+  function strField(buf, offset, str, maxLen) {
+    const bytes = TAR_ENCODER.encode(str);
+    const n = Math.min(bytes.length, maxLen);
+    for (let i = 0; i < n; i++) buf[offset + i] = bytes[i];
+  }
+
+  // A single 512-byte ustar header block.
+  function tarBlock(name, size, mtime, mode, typeflag) {
+    const buf = new Uint8Array(512);
+    strField(buf, 0, name, 100);
+    octalField(buf, 100, mode, 8);
+    octalField(buf, 108, 0, 8);            // uid
+    octalField(buf, 116, 0, 8);            // gid
+    octalField(buf, 124, size, 12);
+    octalField(buf, 136, mtime, 12);
+    for (let i = 148; i < 156; i++) buf[i] = 0x20; // checksum placeholder = spaces
+    buf[156] = typeflag.charCodeAt(0);
+    strField(buf, 257, 'ustar', 6);        // magic "ustar\0"
+    buf[263] = 0x30; buf[264] = 0x30;      // version "00"
+    let sum = 0;
+    for (let i = 0; i < 512; i++) sum += buf[i];
+    octalField(buf, 148, sum, 7);          // 6 octal digits + NUL
+    buf[155] = 0x20;                       // trailing space
+    return buf;
+  }
+
+  // Header blocks for one file, using a GNU long-name block when the path exceeds 100 bytes.
+  function tarHeaders(path, size, mtime) {
+    const nameBytes = TAR_ENCODER.encode(path);
+    const blocks = [];
+    if (nameBytes.length > 100) {
+      const data = new Uint8Array(nameBytes.length + 1);
+      data.set(nameBytes);
+      blocks.push(tarBlock('././@LongLink', data.length, 0, 0, 'L'));
+      const padded = new Uint8Array(Math.ceil(data.length / 512) * 512);
+      padded.set(data);
+      blocks.push(padded);
+    }
+    blocks.push(tarBlock(path, size, mtime, 0o644, '0'));
+    return blocks;
+  }
+
+  // Stream the tar directly into a gzip stream so only one file sits in memory at a time.
+  async function buildTarGz(items) {
+    const cs = new CompressionStream('gzip');
     const writer = cs.writable.getWriter();
-    writer.write(bytes);
-    writer.close();
     const reader = cs.readable.getReader();
-    const chunks = [];
-    let total = 0;
-    for (;;) {
-      const step = await reader.read();
-      if (step.done) break;
-      chunks.push(step.value);
-      total += step.value.length;
-    }
-    const out = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) { out.set(chunk, offset); offset += chunk.length; }
-    return out;
-  }
-
-  function u16(n) { const b = new Uint8Array(2); new DataView(b.buffer).setUint16(0, n, true); return b; }
-  function u32(n) { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n >>> 0, true); return b; }
-  function concatBytes(arrs) {
-    let len = 0;
-    for (const a of arrs) len += a.length;
-    const out = new Uint8Array(len);
-    let o = 0;
-    for (const a of arrs) { out.set(a, o); o += a.length; }
-    return out;
-  }
-
-  function dosDateTime(date) {
-    const time = ((date.getHours() & 0x1F) << 11) | ((date.getMinutes() & 0x3F) << 5) | ((Math.floor(date.getSeconds() / 2)) & 0x1F);
-    const day = ((Math.max(0, date.getFullYear() - 1980)) & 0x7F) << 9 | (((date.getMonth() + 1) & 0xF) << 5) | (date.getDate() & 0x1F);
-    return { time: time, date: day };
-  }
-
-  async function buildZip(items) {
-    const encoder = new TextEncoder();
-    const localParts = [];
-    const centralParts = [];
-    let offset = 0;
+    const out = [];
+    const pump = (async function () {
+      for (;;) {
+        const step = await reader.read();
+        if (step.done) break;
+        out.push(step.value);
+      }
+    })();
 
     for (const item of items) {
-      const nameBytes = encoder.encode(item.path);
       const raw = new Uint8Array(await item.file.arrayBuffer());
-      const crc = crc32(raw);
-      const deflated = await deflateRaw(raw);
-      let method = 0;
-      let data = raw;
-      if (deflated && deflated.length < raw.length) { method = 8; data = deflated; }
-      const stamp = dosDateTime(new Date(item.file.lastModified || Date.now()));
-      const flag = 0x0800;
-
-      const localHeader = concatBytes([
-        u32(0x04034b50), u16(20), u16(flag), u16(method), u16(stamp.time), u16(stamp.date),
-        u32(crc), u32(data.length), u32(raw.length), u16(nameBytes.length), u16(0),
-      ]);
-      localParts.push(localHeader, nameBytes, data);
-
-      // version made by: Unix host (3) so external attrs carry a real file mode (0644).
-      const centralHeader = concatBytes([
-        u32(0x02014b50), u16((3 << 8) | 20), u16(20), u16(flag), u16(method), u16(stamp.time), u16(stamp.date),
-        u32(crc), u32(data.length), u32(raw.length), u16(nameBytes.length), u16(0), u16(0), u16(0), u16(0), u32(0x81A40000),
-        u32(offset),
-      ]);
-      centralParts.push(centralHeader, nameBytes);
-
-      offset += localHeader.length + nameBytes.length + data.length;
+      const mtime = Math.floor((item.file.lastModified || Date.now()) / 1000);
+      for (const block of tarHeaders(item.path, raw.length, mtime)) await writer.write(block);
+      await writer.write(raw);
+      const pad = raw.length % 512;
+      if (pad) await writer.write(new Uint8Array(512 - pad));
     }
+    await writer.write(new Uint8Array(1024)); // two zero blocks mark the end of the archive
+    await writer.close();
+    await pump;
 
-    const centralStart = offset;
-    let centralSize = 0;
-    for (const part of centralParts) centralSize += part.length;
-
-    const eocd = concatBytes([
-      u32(0x06054b50), u16(0), u16(0), u16(items.length), u16(items.length),
-      u32(centralSize), u32(centralStart), u16(0),
-    ]);
-
-    return new Blob(localParts.concat(centralParts, [eocd]), { type: 'application/zip' });
+    return new Blob(out, { type: 'application/gzip' });
   }
 
   function planArchives(files) {
@@ -302,7 +283,7 @@
   }
 
   function archiveName(i) {
-    return 'mu-upload-' + Date.now().toString(36) + '-' + i + '.zip';
+    return 'mu-upload-' + Date.now().toString(36) + '-' + i + '.tar.gz';
   }
 
   // ---- upload plumbing ----
@@ -420,7 +401,7 @@
     return { failed: failed.length, cancelled: controller.cancelled };
   }
 
-  // folders present: zip client-side, upload the archive(s), extract server-side, drop the archive(s)
+  // folders present: tar.gz client-side, upload the archive(s), extract server-side, drop the archive(s)
   async function runArchiveUpload(server, base, bucket, controller, cb) {
     const groups = planArchives(bucket.files);
 
@@ -428,9 +409,9 @@
     const built = [];
     for (let i = 0; i < groups.length; i++) {
       if (controller.cancelled) return { cancelled: true };
-      const blob = await buildZip(groups[i]);
+      const blob = await buildTarGz(groups[i]);
       const name = archiveName(i);
-      built.push({ name: name, file: new File([blob], name, { type: 'application/zip' }) });
+      built.push({ name: name, file: new File([blob], name, { type: 'application/gzip' }) });
     }
     if (controller.cancelled) return { cancelled: true };
 
