@@ -39,13 +39,6 @@ wget https://github.com/Zettio-Service/pterodactyl-addons/raw/main/multi-upload/
 blueprint -install multiupload
 ```
 
-If you publish GitHub Releases, the latest build is also at:
-
-```bash
-wget https://github.com/Zettio-Service/pterodactyl-addons/releases/latest/download/multiupload.blueprint
-blueprint -install multiupload
-```
-
 ### Option 2, build from source
 
 ```bash
