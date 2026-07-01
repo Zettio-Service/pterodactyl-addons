@@ -2,6 +2,9 @@
   if (window.__muLoaded) return;
   window.__muLoaded = true;
 
+  const MU_VERSION = '2.0.0';
+  console.log('[multiupload] ' + MU_VERSION + ' loaded (tar.gz uploader)');
+
   const MAX_FILES_PER_REQUEST = 40;
   const MAX_BYTES_PER_REQUEST = 48 * 1024 * 1024;
   const ARCHIVE_BYTES_LIMIT = 300 * 1024 * 1024;
@@ -97,9 +100,20 @@
     return new Promise(function (resolve) { setTimeout(resolve, ms); });
   }
 
-  function xsrfToken() {
-    const match = document.cookie.match(/(?:^|;\s*)XSRF-TOKEN=([^;]+)/);
+  function cookieValue(name) {
+    const match = document.cookie.match(new RegExp('(?:^|;\\s*)' + name + '=([^;]+)'));
     return match ? decodeURIComponent(match[1]) : '';
+  }
+
+  // The encrypted XSRF-TOKEN cookie, sent as X-XSRF-TOKEN (what the panel's own axios uses).
+  function xsrfToken() {
+    return cookieValue('XSRF-TOKEN');
+  }
+
+  // The raw csrf_token() value from the page meta tag, if the panel embeds one, sent as X-CSRF-TOKEN.
+  function csrfMetaToken() {
+    const meta = document.querySelector('meta[name="csrf-token"]');
+    return meta ? meta.getAttribute('content') || '' : '';
   }
 
   async function postJson(url, body) {
@@ -108,8 +122,10 @@
       'Content-Type': 'application/json',
       'X-Requested-With': 'XMLHttpRequest',
     };
-    const token = xsrfToken();
-    if (token) headers['X-XSRF-TOKEN'] = token;
+    const xsrf = xsrfToken();
+    const csrf = csrfMetaToken();
+    if (xsrf) headers['X-XSRF-TOKEN'] = xsrf;
+    if (csrf) headers['X-CSRF-TOKEN'] = csrf;
     const res = await fetch(url, {
       method: 'POST',
       credentials: 'same-origin',
@@ -121,7 +137,7 @@
       try { detail = (await res.text()).slice(0, 300); } catch (err) { void err; }
       const error = new Error('POST ' + url + ' -> ' + res.status + (detail ? ' ' + detail : ''));
       error.status = res.status;
-      console.error('[multiupload]', error.message);
+      console.error('[multiupload]', error.message, '| xsrf-cookie:', xsrf ? 'yes' : 'NO', '| csrf-meta:', csrf ? 'yes' : 'NO');
       throw error;
     }
   }
