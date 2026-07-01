@@ -67,31 +67,64 @@
     async uploadUrl(server) {
       const res = await fetch('/api/client/servers/' + server + '/files/upload', {
         credentials: 'same-origin',
-        headers: { Accept: 'application/json' },
+        headers: { Accept: 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
       });
       if (!res.ok) throw new Error('Failed to request an upload url (' + res.status + ')');
       const data = await res.json();
       return data.attributes.url;
     },
     async decompress(server, root, file) {
-      const res = await fetch('/api/client/servers/' + server + '/files/decompress', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-        body: JSON.stringify({ root: root, file: file }),
-      });
-      if (!res.ok) throw new Error('Decompress failed (' + res.status + ')');
+      // Wings may need a moment before an just-uploaded archive is visible, so retry a few times.
+      let lastErr = null;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        if (attempt) await sleep(700);
+        try {
+          await postJson('/api/client/servers/' + server + '/files/decompress', { root: root, file: file });
+          return;
+        } catch (err) {
+          lastErr = err;
+          if (err.status && err.status !== 404 && err.status !== 425) break;
+        }
+      }
+      throw lastErr || new Error('Decompress failed');
     },
     async deleteFiles(server, root, files) {
-      const res = await fetch('/api/client/servers/' + server + '/files/delete', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-        body: JSON.stringify({ root: root, files: files }),
-      });
-      if (!res.ok) throw new Error('Delete failed (' + res.status + ')');
+      await postJson('/api/client/servers/' + server + '/files/delete', { root: root, files: files });
     },
   };
+
+  function sleep(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  function xsrfToken() {
+    const match = document.cookie.match(/(?:^|;\s*)XSRF-TOKEN=([^;]+)/);
+    return match ? decodeURIComponent(match[1]) : '';
+  }
+
+  async function postJson(url, body) {
+    const headers = {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      'X-Requested-With': 'XMLHttpRequest',
+    };
+    const token = xsrfToken();
+    if (token) headers['X-XSRF-TOKEN'] = token;
+    const res = await fetch(url, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: headers,
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      let detail = '';
+      try { detail = (await res.text()).slice(0, 300); } catch (err) { void err; }
+      const error = new Error('POST ' + url + ' -> ' + res.status + (detail ? ' ' + detail : ''));
+      error.status = res.status;
+      console.error('[multiupload]', error.message);
+      throw error;
+    }
+  }
 
   // ---- collecting dropped/picked files ----
 
@@ -228,9 +261,10 @@
       ]);
       localParts.push(localHeader, nameBytes, data);
 
+      // version made by: Unix host (3) so external attrs carry a real file mode (0644).
       const centralHeader = concatBytes([
-        u32(0x02014b50), u16(20), u16(20), u16(flag), u16(method), u16(stamp.time), u16(stamp.date),
-        u32(crc), u32(data.length), u32(raw.length), u16(nameBytes.length), u16(0), u16(0), u16(0), u16(0), u32(0),
+        u32(0x02014b50), u16((3 << 8) | 20), u16(20), u16(flag), u16(method), u16(stamp.time), u16(stamp.date),
+        u32(crc), u32(data.length), u32(raw.length), u16(nameBytes.length), u16(0), u16(0), u16(0), u16(0), u32(0x81A40000),
         u32(offset),
       ]);
       centralParts.push(centralHeader, nameBytes);
@@ -527,8 +561,17 @@
     setTimeout(function () { glow.remove(); }, 1900);
   }
 
+  function pokeRevalidate() {
+    // Pterodactyl's file list revalidates on window focus / tab visibility (SWR).
+    window.dispatchEvent(new Event('focus'));
+    document.dispatchEvent(new Event('visibilitychange'));
+  }
+
   function refreshFileList() {
-    setTimeout(function () { window.dispatchEvent(new Event('focus')); }, 400);
+    // Fire a few times, spaced out, to beat SWR's focus throttle after the upload finishes.
+    setTimeout(pokeRevalidate, 300);
+    setTimeout(pokeRevalidate, 1200);
+    setTimeout(pokeRevalidate, 2600);
   }
 
   // ---- orchestration ----
