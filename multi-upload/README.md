@@ -2,21 +2,24 @@
 
 Blueprint extension for Pterodactyl by Erik.
 
-Upload whole folders and several directories into the server file manager at once, keeping
-their structure and without zipping anything first. Everything runs in the browser through the
-standard client API, so Wings is never touched and the extension keeps working across panel and
-Wings updates.
+Upload whole folders into the server file manager at once. The folder is zipped in the browser,
+sent as a single archive, extracted by Wings and the archive is deleted right after, so the
+directory tree ends up intact without ever creating it path by path. Everything runs through the
+standard client API, so Wings itself is never modified and the extension keeps working across
+panel and Wings updates.
 
 Repository: https://github.com/Zettio-Service/pterodactyl-addons (folder `multi-upload`).
 
 ## Features
 
-- "Upload Folders" button next to the native Upload button, styled the same.
-- Drag a folder anywhere on the file manager and the upload starts on drop.
-- The full directory tree is recreated under the folder you are currently viewing.
-- Top indicator with a border that fills in by stage, plus speed and ETA.
-- Parallel batched uploads, cancel any time, retry only the files that failed.
-- When the drop has no folders it falls back to a plain upload.
+- "Upload Folders" button next to the native Upload button, styled the same; opens a folder picker directly.
+- Drag a folder anywhere on the file manager and the upload starts on drop, no dialog in the way.
+- Folders are zipped client-side (native `CompressionStream`, no bundled libraries) and extracted server-side
+  with the existing `files/decompress` endpoint, then the archive is deleted.
+- Very large drops are split into several archives automatically to stay under a safe upload size.
+- Plain files dropped without any folder still upload directly, unarchived.
+- A thin progress bar at the bottom of the page splits into two stages, upload then extract, with the
+  current upload speed shown on the left. Click it to cancel.
 - The file list refreshes on its own and the bottom of the page lights up green when done.
 
 ## Requirements

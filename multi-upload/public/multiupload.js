@@ -4,13 +4,11 @@
 
   const MAX_FILES_PER_REQUEST = 40;
   const MAX_BYTES_PER_REQUEST = 48 * 1024 * 1024;
+  const ARCHIVE_BYTES_LIMIT = 300 * 1024 * 1024;
   const PARALLEL_REQUESTS = 3;
 
   const icons = {
-    folder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2.5h8a2 2 0 0 1 2 2V18a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>',
-    file: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3h7l5 5v13a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z"/><path d="M14 3v5h5"/></svg>',
     up: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20V8"/><path d="M6 14l6-6 6 6"/></svg>',
-    check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 13l4 4L19 7"/></svg>',
   };
 
   function el(tag, props, kids) {
@@ -37,15 +35,6 @@
     return n.toFixed(n < 10 ? 1 : 0) + ' ' + units[i];
   }
 
-  function formatTime(seconds) {
-    seconds = Math.round(seconds);
-    if (seconds < 60) return seconds + 's';
-    const minutes = Math.floor(seconds / 60);
-    if (minutes < 60) return minutes + 'm ' + (seconds % 60) + 's';
-    const hours = Math.floor(minutes / 60);
-    return hours + 'h ' + (minutes % 60) + 'm';
-  }
-
   function sumBytes(items) {
     return items.reduce(function (total, item) { return total + item.file.size; }, 0);
   }
@@ -58,10 +47,6 @@
   function parentOf(path) {
     const cut = path.lastIndexOf('/');
     return cut <= 0 ? '/' : path.slice(0, cut);
-  }
-
-  function baseName(path) {
-    return path.split('/').filter(Boolean).pop() || '';
   }
 
   function currentServer() {
@@ -88,16 +73,27 @@
       const data = await res.json();
       return data.attributes.url;
     },
-    async makeFolder(server, root, name) {
-      const res = await fetch('/api/client/servers/' + server + '/files/create-folder', {
+    async decompress(server, root, file) {
+      const res = await fetch('/api/client/servers/' + server + '/files/decompress', {
         method: 'POST',
         credentials: 'same-origin',
         headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-        body: JSON.stringify({ root: root, name: name }),
+        body: JSON.stringify({ root: root, file: file }),
       });
-      return res.ok;
+      if (!res.ok) throw new Error('Decompress failed (' + res.status + ')');
+    },
+    async deleteFiles(server, root, files) {
+      const res = await fetch('/api/client/servers/' + server + '/files/delete', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ root: root, files: files }),
+      });
+      if (!res.ok) throw new Error('Delete failed (' + res.status + ')');
     },
   };
+
+  // ---- collecting dropped/picked files ----
 
   function readEntries(reader) {
     return new Promise(function (resolve, reject) {
@@ -153,38 +149,129 @@
     return Promise.resolve({ files: [], dirs: new Set() });
   }
 
-  function modelFromItems(items) {
-    const model = { files: items, dirs: new Set() };
+  // ---- zero-dependency zip writer (store or deflate-raw via CompressionStream) ----
+
+  const CRC_TABLE = (function () {
+    const table = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      table[n] = c >>> 0;
+    }
+    return table;
+  })();
+
+  function crc32(bytes) {
+    let crc = 0xFFFFFFFF;
+    for (let i = 0; i < bytes.length; i++) crc = CRC_TABLE[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
+    return (crc ^ 0xFFFFFFFF) >>> 0;
+  }
+
+  async function deflateRaw(bytes) {
+    if (typeof CompressionStream === 'undefined') return null;
+    const cs = new CompressionStream('deflate-raw');
+    const writer = cs.writable.getWriter();
+    writer.write(bytes);
+    writer.close();
+    const reader = cs.readable.getReader();
+    const chunks = [];
+    let total = 0;
+    for (;;) {
+      const step = await reader.read();
+      if (step.done) break;
+      chunks.push(step.value);
+      total += step.value.length;
+    }
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) { out.set(chunk, offset); offset += chunk.length; }
+    return out;
+  }
+
+  function u16(n) { const b = new Uint8Array(2); new DataView(b.buffer).setUint16(0, n, true); return b; }
+  function u32(n) { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n >>> 0, true); return b; }
+  function concatBytes(arrs) {
+    let len = 0;
+    for (const a of arrs) len += a.length;
+    const out = new Uint8Array(len);
+    let o = 0;
+    for (const a of arrs) { out.set(a, o); o += a.length; }
+    return out;
+  }
+
+  function dosDateTime(date) {
+    const time = ((date.getHours() & 0x1F) << 11) | ((date.getMinutes() & 0x3F) << 5) | ((Math.floor(date.getSeconds() / 2)) & 0x1F);
+    const day = ((Math.max(0, date.getFullYear() - 1980)) & 0x7F) << 9 | (((date.getMonth() + 1) & 0xF) << 5) | (date.getDate() & 0x1F);
+    return { time: time, date: day };
+  }
+
+  async function buildZip(items) {
+    const encoder = new TextEncoder();
+    const localParts = [];
+    const centralParts = [];
+    let offset = 0;
+
     for (const item of items) {
-      const segments = item.path.split('/').slice(0, -1);
-      let acc = '';
-      for (const seg of segments) {
-        acc = acc ? acc + '/' + seg : seg;
-        model.dirs.add(acc);
-      }
+      const nameBytes = encoder.encode(item.path);
+      const raw = new Uint8Array(await item.file.arrayBuffer());
+      const crc = crc32(raw);
+      const deflated = await deflateRaw(raw);
+      let method = 0;
+      let data = raw;
+      if (deflated && deflated.length < raw.length) { method = 8; data = deflated; }
+      const stamp = dosDateTime(new Date(item.file.lastModified || Date.now()));
+      const flag = 0x0800;
+
+      const localHeader = concatBytes([
+        u32(0x04034b50), u16(20), u16(flag), u16(method), u16(stamp.time), u16(stamp.date),
+        u32(crc), u32(data.length), u32(raw.length), u16(nameBytes.length), u16(0),
+      ]);
+      localParts.push(localHeader, nameBytes, data);
+
+      const centralHeader = concatBytes([
+        u32(0x02014b50), u16(20), u16(20), u16(flag), u16(method), u16(stamp.time), u16(stamp.date),
+        u32(crc), u32(data.length), u32(raw.length), u16(nameBytes.length), u16(0), u16(0), u16(0), u16(0), u32(0),
+        u32(offset),
+      ]);
+      centralParts.push(centralHeader, nameBytes);
+
+      offset += localHeader.length + nameBytes.length + data.length;
     }
-    return model;
+
+    const centralStart = offset;
+    let centralSize = 0;
+    for (const part of centralParts) centralSize += part.length;
+
+    const eocd = concatBytes([
+      u32(0x06054b50), u16(0), u16(0), u16(items.length), u16(items.length),
+      u32(centralSize), u32(centralStart), u16(0),
+    ]);
+
+    return new Blob(localParts.concat(centralParts, [eocd]), { type: 'application/zip' });
   }
 
-  function leafDirs(dirSet) {
-    const all = Array.from(dirSet);
-    return all.filter(function (dir) {
-      for (const other of all) {
-        if (other !== dir && other.indexOf(dir + '/') === 0) return false;
+  function planArchives(files) {
+    const archives = [];
+    let chunk = [];
+    let bytes = 0;
+    for (const item of files) {
+      if (chunk.length && bytes + item.file.size > ARCHIVE_BYTES_LIMIT) {
+        archives.push(chunk);
+        chunk = [];
+        bytes = 0;
       }
-      return true;
-    });
+      chunk.push(item);
+      bytes += item.file.size;
+    }
+    if (chunk.length) archives.push(chunk);
+    return archives;
   }
 
-  async function ensureLeaf(server, base, rel) {
-    if (await api.makeFolder(server, base, rel)) return;
-    const segments = rel.split('/').filter(Boolean);
-    let acc = base;
-    for (const seg of segments) {
-      await api.makeFolder(server, acc, seg);
-      acc = acc === '/' ? '/' + seg : acc + '/' + seg;
-    }
+  function archiveName(i) {
+    return 'mu-upload-' + Date.now().toString(36) + '-' + i + '.zip';
   }
+
+  // ---- upload plumbing ----
 
   function planBatches(base, files) {
     const groups = new Map();
@@ -223,7 +310,7 @@
     return controller;
   }
 
-  function sendBatch(url, directory, files, controller, onProgress) {
+  function sendFiles(url, directory, files, controller, onProgress) {
     return new Promise(function (resolve, reject) {
       if (controller.cancelled) { reject(new Error('cancelled')); return; }
       const form = new FormData();
@@ -249,7 +336,7 @@
     const runners = [];
     for (let i = 0; i < Math.min(limit, items.length); i++) {
       runners.push((async function () {
-        while (true) {
+        for (;;) {
           const index = cursor++;
           if (index >= items.length) break;
           await worker(items[index], index);
@@ -259,122 +346,179 @@
     await Promise.all(runners);
   }
 
-  async function runUpload(server, base, model, controller, cb) {
-    const leaves = leafDirs(model.dirs).sort(function (a, b) { return a.split('/').length - b.split('/').length; });
-    for (let i = 0; i < leaves.length; i++) {
-      if (controller.cancelled) break;
-      cb.stage('Preparing folders ' + (i + 1) + '/' + leaves.length, true);
-      await ensureLeaf(server, base, leaves[i]);
-    }
-
-    const batches = planBatches(base, model.files);
-    const total = sumBytes(model.files) || 1;
-    const succeeded = new Set();
+  // plain files, no folders: upload straight to the current directory, same as the native uploader
+  async function runPlainUpload(server, base, bucket, controller, cb) {
+    const batches = planBatches(base, bucket.files);
+    const total = sumBytes(bucket.files) || 1;
     const loadedByBatch = new Map();
     let completed = 0;
     let url = await api.uploadUrl(server);
 
-    cb.stage('Uploading', false);
     const report = function () {
       let live = 0;
       loadedByBatch.forEach(function (value) { live += value; });
       cb.progress(completed + live, total);
     };
 
+    const failed = [];
     await runPool(batches, PARALLEL_REQUESTS, async function (batch, index) {
       if (controller.cancelled) return;
-      for (const item of batch.items) if (item.row) item.row.classList.add('mu-active');
       const batchBytes = sumBytes(batch.items);
       const files = batch.items.map(function (x) { return x.file; });
       const onProgress = function (loaded) { loadedByBatch.set(index, loaded); report(); };
       let ok = true;
       try {
-        await sendBatch(url, batch.dir, files, controller, onProgress);
+        await sendFiles(url, batch.dir, files, controller, onProgress);
       } catch (first) {
         void first;
         if (!controller.cancelled) {
           try {
             url = await api.uploadUrl(server);
-            await sendBatch(url, batch.dir, files, controller, onProgress);
+            await sendFiles(url, batch.dir, files, controller, onProgress);
           } catch (second) { void second; ok = false; }
         } else ok = false;
       }
       loadedByBatch.delete(index);
-      if (ok) completed += batchBytes;
+      if (ok) completed += batchBytes; else failed.push(batch);
       report();
-      for (const item of batch.items) {
-        if (item.row) item.row.classList.remove('mu-active');
-        if (ok) { succeeded.add(item); if (item.row) item.row.classList.add('mu-ok'); }
-        else if (item.row) item.row.classList.add('mu-err');
-      }
     });
 
-    const failedItems = model.files.filter(function (item) { return !succeeded.has(item); });
-    return { ok: model.files.length - failedItems.length, failed: failedItems.length, failedItems: failedItems, cancelled: controller.cancelled };
+    return { failed: failed.length, cancelled: controller.cancelled };
   }
 
-  let dock = null;
-  let dockText = null;
-  let dockPct = null;
-  let dockTimer = null;
+  // folders present: zip client-side, upload the archive(s), extract server-side, drop the archive(s)
+  async function runArchiveUpload(server, base, bucket, controller, cb) {
+    const groups = planArchives(bucket.files);
 
-  function ensureDock() {
-    if (dock) return;
-    dockText = el('span', { class: 'mu-dock-text' });
-    dockPct = el('span', { class: 'mu-dock-pct' });
-    dock = el('div', { class: 'mu-dock', style: 'display:none' }, [
-      el('span', { class: 'mu-dock-ic', html: icons.folder }),
-      dockText,
-      dockPct,
-    ]);
-    document.body.appendChild(dock);
+    cb.buildStart();
+    const built = [];
+    for (let i = 0; i < groups.length; i++) {
+      if (controller.cancelled) return { cancelled: true };
+      const blob = await buildZip(groups[i]);
+      const name = archiveName(i);
+      built.push({ name: name, file: new File([blob], name, { type: 'application/zip' }) });
+    }
+    if (controller.cancelled) return { cancelled: true };
+
+    cb.uploadStart();
+    const total = built.reduce(function (sum, item) { return sum + item.file.size; }, 0) || 1;
+    const loadedByIndex = new Map();
+    let url = await api.uploadUrl(server);
+
+    const report = function () {
+      let live = 0;
+      loadedByIndex.forEach(function (value) { live += value; });
+      cb.uploadProgress(live, total);
+    };
+
+    const failed = [];
+    await runPool(built, PARALLEL_REQUESTS, async function (item, index) {
+      if (controller.cancelled) return;
+      const onProgress = function (loaded) { loadedByIndex.set(index, loaded); report(); };
+      let ok = true;
+      try {
+        await sendFiles(url, base, [item.file], controller, onProgress);
+      } catch (first) {
+        void first;
+        if (!controller.cancelled) {
+          try {
+            url = await api.uploadUrl(server);
+            await sendFiles(url, base, [item.file], controller, onProgress);
+          } catch (second) { void second; ok = false; }
+        } else ok = false;
+      }
+      loadedByIndex.set(index, item.file.size);
+      report();
+      if (!ok) failed.push(item);
+    });
+
+    if (controller.cancelled) return { cancelled: true };
+
+    cb.extractStart();
+    let ok = failed.length === 0;
+    for (const item of built) {
+      if (failed.indexOf(item) !== -1) continue;
+      try {
+        await api.decompress(server, base, item.name);
+        await api.deleteFiles(server, base, [item.name]);
+      } catch (err) { void err; ok = false; }
+    }
+    cb.extractDone(ok);
+    return { cancelled: false, ok: ok };
   }
 
-  function dockLabel(model) {
-    if (model.dirs.size) return model.dirs.size + ' folder' + (model.dirs.size === 1 ? '' : 's');
-    return model.files.length + ' file' + (model.files.length === 1 ? '' : 's');
+  // ---- bottom progress bar ----
+
+  let bb = null;
+  let bbUploadSeg = null;
+  let bbUploadFill = null;
+  let bbExtractSeg = null;
+  let bbExtractFill = null;
+  let bbSpeed = null;
+  let bbTimer = null;
+  let bbController = null;
+
+  function ensureBB() {
+    if (bb) return;
+    bbUploadFill = el('div', { class: 'mu-bb-fill' });
+    bbSpeed = el('span', { class: 'mu-bb-speed' });
+    bbUploadSeg = el('div', { class: 'mu-bb-seg' }, [bbUploadFill, bbSpeed]);
+    bbExtractFill = el('div', { class: 'mu-bb-fill' });
+    bbExtractSeg = el('div', { class: 'mu-bb-seg' }, [bbExtractFill]);
+    bb = el('div', { class: 'mu-bb', style: 'display:none', title: 'Click to cancel' }, [bbUploadSeg, bbExtractSeg]);
+    bb.addEventListener('click', function () { if (bbController) bbController.cancel(); });
+    document.body.appendChild(bb);
   }
 
-  function dockShow(label) {
-    ensureDock();
-    clearTimeout(dockTimer);
-    dock.classList.remove('mu-dock-done');
-    dock.classList.add('mu-indet');
-    dock.style.setProperty('--p', 0);
-    dock.dataset.label = label;
-    dockText.textContent = 'Uploading ' + label;
-    dockPct.textContent = '';
-    dock.style.display = '';
+  function bbShow(twoStage, controller) {
+    ensureBB();
+    clearTimeout(bbTimer);
+    bbController = controller;
+    bb.classList.toggle('mu-bb-onestage', !twoStage);
+    bbUploadSeg.classList.remove('mu-bb-err', 'mu-bb-indet');
+    bbExtractSeg.classList.remove('mu-bb-err', 'mu-bb-indet');
+    bbUploadFill.style.width = '0%';
+    bbExtractFill.style.width = '0%';
+    bbSpeed.textContent = '';
+    bb.style.display = '';
   }
 
-  function dockStage(text, indeterminate) {
-    if (!dock) return;
-    dock.classList.toggle('mu-indet', !!indeterminate);
-    dockText.textContent = text + ', ' + dock.dataset.label;
+  function bbBuildStart() {
+    bbUploadSeg.classList.add('mu-bb-indet');
   }
 
-  function dockProgress(p) {
-    if (!dock) return;
-    dock.classList.remove('mu-indet');
-    dock.style.setProperty('--p', p);
-    dockText.textContent = 'Uploading ' + dock.dataset.label;
-    dockPct.textContent = p + '%';
+  function bbUploadStart() {
+    bbUploadSeg.classList.remove('mu-bb-indet');
   }
 
-  function dockDone(text) {
-    if (!dock) return;
-    dock.classList.remove('mu-indet');
-    dock.classList.add('mu-dock-done');
-    dock.style.setProperty('--p', 100);
-    dockText.textContent = text;
-    dockPct.textContent = '';
-    dockTimer = setTimeout(function () { if (dock) dock.style.display = 'none'; }, 4500);
+  function bbUploadProgress(pct, speedTxt) {
+    bbUploadFill.style.width = pct + '%';
+    bbSpeed.textContent = speedTxt || '';
   }
 
-  function hideDock() {
-    if (!dock) return;
-    clearTimeout(dockTimer);
-    dock.style.display = 'none';
+  function bbExtractStart() {
+    bbUploadFill.style.width = '100%';
+    bbSpeed.textContent = '';
+    bbExtractSeg.classList.add('mu-bb-indet');
+  }
+
+  function bbExtractDone(ok) {
+    bbExtractSeg.classList.remove('mu-bb-indet');
+    bbExtractFill.style.width = '100%';
+    if (!ok) bbExtractSeg.classList.add('mu-bb-err');
+  }
+
+  function bbFail(stage) {
+    const seg = stage === 'extract' ? bbExtractSeg : bbUploadSeg;
+    seg.classList.remove('mu-bb-indet');
+    seg.classList.add('mu-bb-err');
+    bbTimer = setTimeout(bbHide, 3000);
+  }
+
+  function bbHide() {
+    clearTimeout(bbTimer);
+    if (bb) bb.style.display = 'none';
+    bbController = null;
   }
 
   function bottomGlow() {
@@ -387,251 +531,76 @@
     setTimeout(function () { window.dispatchEvent(new Event('focus')); }, 400);
   }
 
-  async function dockOnlyUpload(server, base, model) {
-    const label = dockLabel(model);
-    dockShow(label);
-    const controller = createController();
-    const cb = {
-      stage: function (text, indeterminate) { dockStage(text, indeterminate); },
-      progress: function (loaded, total) { dockProgress(Math.min(100, Math.round((loaded / total) * 100))); },
+  // ---- orchestration ----
+
+  function makeSpeedTracker() {
+    let sampleBytes = 0;
+    let sampleTime = Date.now();
+    let speed = 0;
+    return function (loaded) {
+      const now = Date.now();
+      const dt = (now - sampleTime) / 1000;
+      if (dt >= 0.3) {
+        const instant = (loaded - sampleBytes) / dt;
+        speed = speed ? speed * 0.6 + instant * 0.4 : instant;
+        sampleBytes = loaded;
+        sampleTime = now;
+      }
+      return speed > 0 ? formatBytes(speed) + '/s' : '';
     };
-    let result;
-    try {
-      result = await runUpload(server, base, model, controller, cb);
-    } catch (err) {
-      void err;
-      dockDone('Upload failed');
-      return;
-    }
-    if (result.failed) dockDone(result.ok + ' of ' + (result.ok + result.failed) + ' uploaded');
-    else { hideDock(); bottomGlow(); }
-    refreshFileList();
   }
 
-  let currentAdd = null;
-  let currentDropEl = null;
+  let busy = false;
 
-  function openModal(initial, autostart) {
+  async function startUploadFlow(bucket) {
+    if (busy || !bucket.files.length) return;
     const server = currentServer();
     if (!server) return;
+    busy = true;
 
-    const model = { files: [], dirs: new Set(), seen: new Set() };
-    let uploading = false;
+    const base = currentDir();
+    const hasDirs = bucket.dirs.size > 0;
+    const controller = createController();
+    const trackSpeed = makeSpeedTracker();
+    bbShow(hasDirs, controller);
 
-    const summary = el('div', { class: 'mu-summary mu-empty' });
-    const list = el('div', { class: 'mu-list' });
-    const goBtn = el('button', { class: 'mu-go', text: 'Upload', disabled: '' });
-
-    function add(bucket) {
-      if (uploading) return;
-      for (const dir of bucket.dirs) model.dirs.add(dir);
-      for (const item of bucket.files) {
-        const key = item.path + ':' + item.file.size;
-        if (model.seen.has(key)) continue;
-        model.seen.add(key);
-        model.files.push(item);
+    try {
+      if (!hasDirs) {
+        const result = await runPlainUpload(server, base, bucket, controller, {
+          progress: function (loaded, total) {
+            const pct = Math.min(100, Math.round((loaded / total) * 100));
+            bbUploadProgress(pct, trackSpeed(loaded));
+          },
+        });
+        if (result.cancelled) { bbHide(); return; }
+        if (result.failed) { bbFail('upload'); return; }
+      } else {
+        const result = await runArchiveUpload(server, base, bucket, controller, {
+          buildStart: bbBuildStart,
+          uploadStart: bbUploadStart,
+          uploadProgress: function (loaded, total) {
+            const pct = Math.min(100, Math.round((loaded / total) * 100));
+            bbUploadProgress(pct, trackSpeed(loaded));
+          },
+          extractStart: bbExtractStart,
+          extractDone: bbExtractDone,
+        });
+        if (result.cancelled) { bbHide(); return; }
+        if (!result.ok) { bbFail('extract'); return; }
       }
-      renderSummary();
-    }
 
-    function renderSummary() {
-      const count = model.files.length;
-      const total = sumBytes(model.files);
-      summary.className = 'mu-summary' + (count ? '' : ' mu-empty');
-      summary.innerHTML = '';
-      summary.appendChild(el('div', { html: '<b>' + count + '</b> file' + (count === 1 ? '' : 's') }));
-      summary.appendChild(el('div', { html: '<b>' + model.dirs.size + '</b> folder' + (model.dirs.size === 1 ? '' : 's') }));
-      summary.appendChild(el('div', { html: '<b>' + formatBytes(total) + '</b> total' }));
-      list.innerHTML = '';
-      const shown = model.files.slice(0, 200);
-      for (const item of shown) {
-        item.row = el('div', { class: 'mu-row' }, [
-          el('span', { class: 'mu-dot' }),
-          el('span', { class: 'mu-path', text: item.path }),
-          el('span', { class: 'mu-size', text: formatBytes(item.file.size) }),
-        ]);
-        list.appendChild(item.row);
-      }
-      if (model.files.length > shown.length) {
-        list.appendChild(el('div', { class: 'mu-row', text: '+ ' + (model.files.length - shown.length) + ' more' }));
-      }
-      list.style.display = count ? '' : 'none';
-      goBtn.disabled = !count;
-    }
-
-    const folderInput = el('input', { type: 'file', webkitdirectory: '', directory: '', multiple: '', style: 'display:none' });
-    const fileInput = el('input', { type: 'file', multiple: '', style: 'display:none' });
-    folderInput.addEventListener('change', function () { if (folderInput.files.length) add(collectPicked(folderInput.files)); folderInput.value = ''; });
-    fileInput.addEventListener('change', function () { if (fileInput.files.length) add(collectPicked(fileInput.files)); fileInput.value = ''; });
-
-    const drop = el('div', { class: 'mu-drop' }, [
-      el('div', { class: 'mu-ring', html: icons.up }),
-      el('strong', { text: 'Drop folders or files here' }),
-      el('span', { text: 'Drop anywhere on the page, trees stay intact and nothing gets zipped' }),
-      el('div', { class: 'mu-pick' }, [
-        el('button', { onclick: function () { folderInput.click(); } }, [el('span', { html: icons.folder }), 'Select folder']),
-        el('button', { onclick: function () { fileInput.click(); } }, [el('span', { html: icons.file }), 'Select files']),
-      ]),
-      folderInput,
-      fileInput,
-    ]);
-
-    const progress = el('div', { class: 'mu-progress', style: 'display:none' });
-    const bar = el('div', { class: 'mu-bar' });
-    const metaLeft = el('b', { text: '0%' });
-    const metaRight = el('span', { text: '' });
-    progress.appendChild(el('div', { class: 'mu-track' }, [bar]));
-    progress.appendChild(el('div', { class: 'mu-meta' }, [metaLeft, metaRight]));
-
-    const foot = el('div', { class: 'mu-foot' });
-    const body = el('div', { class: 'mu-body' }, [drop, summary, list, progress]);
-
-    const closeBtn = el('button', { class: 'mu-x', text: '×' });
-    const head = el('div', { class: 'mu-head' }, [
-      el('div', { class: 'mu-badge', html: icons.folder }),
-      el('div', {}, [el('h2', { text: 'Multi upload' }), el('p', { text: 'Destination: ' + currentDir() })]),
-      closeBtn,
-    ]);
-
-    const card = el('div', { class: 'mu-card' }, [head, body, foot]);
-    const backdrop = el('div', { class: 'mu-backdrop' }, [card]);
-
-    function close() {
-      if (backdrop.classList.contains('mu-closing')) return;
-      document.removeEventListener('keydown', onKey);
-      currentAdd = null;
-      currentDropEl = null;
-      backdrop.classList.add('mu-closing');
-      setTimeout(function () { backdrop.remove(); }, 200);
-    }
-    function onKey(e) { if (e.key === 'Escape' && !uploading) close(); }
-    backdrop.addEventListener('mousedown', function (e) { if (e.target === backdrop && !uploading) close(); });
-    closeBtn.addEventListener('click', function () { if (!uploading) close(); });
-    document.addEventListener('keydown', onKey);
-
-    function idleFoot() {
-      foot.innerHTML = '';
-      foot.appendChild(el('button', { text: 'Cancel', onclick: function () { if (!uploading) close(); } }));
-      foot.appendChild(el('div', { class: 'mu-spacer' }));
-      foot.appendChild(goBtn);
-    }
-
-    function startUpload(uploadModel) {
-      uploading = true;
-      const base = currentDir();
-      const label = dockLabel(uploadModel);
-      dockShow(label);
-
-      drop.style.display = 'none';
-      summary.style.display = 'none';
-      list.style.display = '';
-      progress.style.display = '';
-      bar.classList.remove('mu-finished');
-      const previousDone = body.querySelector('.mu-done');
-      if (previousDone) previousDone.remove();
-
-      const controller = createController();
-      const prog = { loaded: 0, total: sumBytes(uploadModel.files) || 1 };
-      let sampleBytes = 0;
-      let sampleTime = Date.now();
-      let speed = 0;
-
-      const ticker = setInterval(function () {
-        const now = Date.now();
-        const dt = (now - sampleTime) / 1000;
-        if (dt >= 0.3) {
-          const instant = (prog.loaded - sampleBytes) / dt;
-          speed = speed ? speed * 0.6 + instant * 0.4 : instant;
-          sampleBytes = prog.loaded;
-          sampleTime = now;
-        }
-        const remaining = Math.max(0, prog.total - prog.loaded);
-        const eta = speed > 1 ? remaining / speed : 0;
-        metaRight.textContent = (speed > 0 ? formatBytes(speed) + '/s' : '') + (eta > 0 ? ', ~' + formatTime(eta) : '');
-      }, 600);
-
-      foot.innerHTML = '';
-      const abortBtn = el('button', { text: 'Cancel' });
-      abortBtn.addEventListener('click', function () {
-        controller.cancel();
-        abortBtn.disabled = true;
-        abortBtn.textContent = 'Stopping…';
-      });
-      foot.appendChild(abortBtn);
-      foot.appendChild(el('div', { class: 'mu-spacer' }));
-
-      const cb = {
-        stage: function (text, indeterminate) {
-          dockStage(text, indeterminate);
-          if (indeterminate) metaRight.textContent = text;
-        },
-        progress: function (loaded, total) {
-          prog.loaded = loaded;
-          const p = Math.min(100, Math.round((loaded / total) * 100));
-          bar.style.width = p + '%';
-          metaLeft.textContent = p + '%';
-          dockProgress(p);
-        },
-      };
-
-      runUpload(server, base, uploadModel, controller, cb).then(function (result) {
-        clearInterval(ticker);
-        uploading = false;
-        finishUpload(result, prog);
-      }).catch(function (err) {
-        clearInterval(ticker);
-        uploading = false;
-        metaRight.textContent = err.message;
-        dockDone('Upload failed');
-        foot.innerHTML = '';
-        foot.appendChild(el('button', { text: 'Close', onclick: close }));
-      });
-    }
-
-    function finishUpload(result, prog) {
-      hideDock();
       refreshFileList();
-
-      if (!result.failed && !result.cancelled) {
-        bottomGlow();
-        setTimeout(close, 500);
-        return;
-      }
-
-      const percent = Math.min(100, Math.round((prog.loaded / prog.total) * 100));
-      bar.classList.add('mu-finished');
-      bar.style.width = percent + '%';
-      metaLeft.textContent = percent + '%';
-      metaRight.textContent = '';
-
-      body.appendChild(el('div', { class: 'mu-done' }, [
-        el('div', { class: 'mu-check mu-check-warn', html: icons.check }),
-        el('strong', { text: result.cancelled ? 'Upload stopped' : (result.ok + ' uploaded, ' + result.failed + ' failed') }),
-        el('span', { class: 'mu-size', text: 'Retry the files that did not make it' }),
-      ]));
-
-      foot.innerHTML = '';
-      foot.appendChild(el('button', { text: 'Close', onclick: close }));
-      foot.appendChild(el('div', { class: 'mu-spacer' }));
-      if (result.failedItems.length) {
-        foot.appendChild(el('button', { class: 'mu-go', text: 'Retry failed (' + result.failedItems.length + ')', onclick: function () {
-          const items = result.failedItems;
-          for (const item of items) if (item.row) item.row.classList.remove('mu-err', 'mu-ok');
-          startUpload(modelFromItems(items));
-        } }));
-      }
+      bottomGlow();
+      bbTimer = setTimeout(bbHide, 500);
+    } catch (err) {
+      console.error('[multiupload]', err);
+      bbFail(hasDirs ? 'extract' : 'upload');
+    } finally {
+      busy = false;
     }
-
-    goBtn.addEventListener('click', function () { startUpload(model); });
-
-    idleFoot();
-    renderSummary();
-    document.body.appendChild(backdrop);
-    currentAdd = add;
-    currentDropEl = drop;
-    if (initial) add(initial);
-    if (initial && autostart && model.files.length) startUpload(model);
   }
+
+  // ---- drag and drop ----
 
   let overlay = null;
 
@@ -660,8 +629,7 @@
       if (!onFilesPage() || !dragHasFiles(e)) return;
       e.preventDefault();
       e.stopImmediatePropagation();
-      if (currentDropEl) currentDropEl.classList.add('mu-hot');
-      else showOverlay();
+      showOverlay();
     }, true);
 
     window.addEventListener('dragover', function (e) {
@@ -675,7 +643,6 @@
       if (!onFilesPage() || !dragHasFiles(e)) return;
       if (e.relatedTarget) return;
       hideOverlay();
-      if (currentDropEl) currentDropEl.classList.remove('mu-hot');
     }, true);
 
     window.addEventListener('drop', async function (e) {
@@ -683,19 +650,29 @@
       e.preventDefault();
       e.stopImmediatePropagation();
       hideOverlay();
-      if (currentDropEl) currentDropEl.classList.remove('mu-hot');
       const bucket = await collectTransfer(e.dataTransfer);
-      if (!bucket.files.length) return;
-      if (currentAdd) { currentAdd(bucket); return; }
-      if (bucket.dirs.size) { openModal(bucket, true); return; }
-      const server = currentServer();
-      if (server) dockOnlyUpload(server, currentDir(), bucket);
+      startUploadFlow(bucket);
     }, true);
+  }
+
+  // ---- action button ----
+
+  let folderInput = null;
+
+  function ensureFolderInput() {
+    if (folderInput) return;
+    folderInput = el('input', { type: 'file', webkitdirectory: '', directory: '', multiple: '', style: 'display:none' });
+    folderInput.addEventListener('change', function () {
+      if (folderInput.files.length) startUploadFlow(collectPicked(folderInput.files));
+      folderInput.value = '';
+    });
+    document.body.appendChild(folderInput);
   }
 
   function mountActionButton() {
     if (!onFilesPage()) return;
     if (document.getElementById('mu-action')) return;
+    ensureFolderInput();
     let uploadBtn = null;
     let dirBtn = null;
     const buttons = document.querySelectorAll('button');
@@ -712,7 +689,7 @@
     button.type = 'button';
     button.className = anchor.className;
     button.textContent = 'Upload Folders';
-    button.addEventListener('click', function () { openModal(); });
+    button.addEventListener('click', function () { folderInput.click(); });
     anchor.parentNode.insertBefore(button, uploadBtn || anchor);
   }
 

@@ -1,9 +1,9 @@
 info:
   name: "Multi Upload"
   identifier: "multiupload"
-  description: "Upload whole folders and several directories into the file manager at once, keeping their structure and without zipping anything beforehand."
+  description: "Upload whole folders into the file manager at once: zipped in the browser, uploaded, extracted and cleaned up automatically, keeping the folder structure."
   flags: ""
-  version: "1.0.0"
+  version: "2.0.0"
   target: "beta-2026-06"
   author: "Erik"
   icon: "assets/icon.svg"
